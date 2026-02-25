@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
+import { trash } from "@raycast/api";
 
 const execFileAsync = promisify(execFile);
 
@@ -16,6 +17,8 @@ export interface WorktreeItem {
   repoName: string;
   isMain: boolean;
   repoRoot: string;
+  /** Directory mtime for "most recent first" sorting (optional). */
+  lastModifiedMs?: number;
 }
 
 interface RepoInfo {
@@ -52,14 +55,45 @@ function getMainRepoPath(worktreePath: string): string | null {
     const commondirPath = path.join(gitDir, "commondir");
     if (fs.existsSync(commondirPath)) {
       const common = fs.readFileSync(commondirPath, "utf-8").trim();
-      const mainGitDir = path.isAbsolute(common)
-        ? common
-        : path.resolve(path.dirname(commondirPath), common);
+      const mainGitDir = path.isAbsolute(common) ? common : path.resolve(path.dirname(commondirPath), common);
       return path.dirname(mainGitDir);
     }
     return path.dirname(gitDir);
   } catch {
     return null;
+  }
+}
+
+const MAX_REPO_SCAN_DEPTH = 15;
+
+function collectReposRecursive(dirPath: string, results: RepoInfo[], seenMainPaths: Set<string>, depth: number): void {
+  if (depth > MAX_REPO_SCAN_DEPTH) return;
+  if (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) return;
+  try {
+    if (isGitRepo(dirPath)) {
+      const stat = fs.statSync(path.join(dirPath, ".git"));
+      if (stat.isFile()) {
+        const mainPath = getMainRepoPath(dirPath);
+        if (mainPath && !seenMainPaths.has(mainPath)) {
+          seenMainPaths.add(mainPath);
+          results.push({ path: mainPath });
+        }
+      } else {
+        const resolved = path.resolve(dirPath);
+        if (!seenMainPaths.has(resolved)) {
+          seenMainPaths.add(resolved);
+          results.push({ path: resolved });
+        }
+      }
+      return;
+    }
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    for (const ent of entries) {
+      if (!ent.isDirectory() || ent.name === ".git") continue;
+      collectReposRecursive(path.join(dirPath, ent.name), results, seenMainPaths, depth + 1);
+    }
+  } catch (err) {
+    logGitError("getReposForRoot error", dirPath, err);
   }
 }
 
@@ -69,43 +103,7 @@ export function getReposForRoot(rootPath: string): RepoInfo[] {
   }
   const results: RepoInfo[] = [];
   const seenMainPaths = new Set<string>();
-  try {
-    if (isGitRepo(rootPath)) {
-      const stat = fs.statSync(path.join(rootPath, ".git"));
-      if (stat.isFile()) {
-        const mainPath = getMainRepoPath(rootPath);
-        if (mainPath && !seenMainPaths.has(mainPath)) {
-          seenMainPaths.add(mainPath);
-          results.push({ path: mainPath });
-        }
-      } else {
-        seenMainPaths.add(rootPath);
-        results.push({ path: path.resolve(rootPath) });
-      }
-    }
-    const entries = fs.readdirSync(rootPath, { withFileTypes: true });
-    for (const ent of entries) {
-      if (!ent.isDirectory()) continue;
-      const fullPath = path.join(rootPath, ent.name);
-      if (!isGitRepo(fullPath)) continue;
-      const stat = fs.statSync(path.join(fullPath, ".git"));
-      if (stat.isFile()) {
-        const mainPath = getMainRepoPath(fullPath);
-        if (mainPath && !seenMainPaths.has(mainPath)) {
-          seenMainPaths.add(mainPath);
-          results.push({ path: mainPath });
-        }
-        continue;
-      }
-      const resolved = path.resolve(fullPath);
-      if (!seenMainPaths.has(resolved)) {
-        seenMainPaths.add(resolved);
-        results.push({ path: resolved });
-      }
-    }
-  } catch (err) {
-    logGitError("getReposForRoot error", rootPath, err);
-  }
+  collectReposRecursive(path.resolve(rootPath), results, seenMainPaths, 0);
   return results;
 }
 
@@ -164,18 +162,30 @@ export async function getAllWorktrees(roots: string[]): Promise<WorktreeItem[]> 
         const absPath = path.isAbsolute(wt.path) ? wt.path : path.resolve(repo.path, wt.path);
         if (seenPaths.has(absPath)) continue;
         seenPaths.add(absPath);
+        let lastModifiedMs: number | undefined;
+        try {
+          lastModifiedMs = fs.statSync(absPath).mtimeMs;
+        } catch {
+          // path may not exist in edge cases
+        }
         items.push({
           path: absPath,
           branch: wt.branch ?? "(detached)",
           repoName,
           isMain: absPath === mainPath,
           repoRoot: repo.path,
+          lastModifiedMs,
         });
       }
     }
   }
 
-  return items.sort((a, b) => a.path.localeCompare(b.path));
+  return items.sort((a, b) => {
+    const aMs = a.lastModifiedMs ?? 0;
+    const bMs = b.lastModifiedMs ?? 0;
+    if (bMs !== aMs) return bMs - aMs;
+    return a.path.localeCompare(b.path);
+  });
 }
 
 export async function getBranches(repoPath: string): Promise<string[]> {
@@ -234,11 +244,10 @@ async function getDefaultRemote(repoPath: string): Promise<string | null> {
 async function getUpstreamRef(repoPath: string, localBranch: string): Promise<string | null> {
   if (!fs.existsSync(repoPath) || !isGitRepo(repoPath)) return null;
   try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["rev-parse", "--abbrev-ref", `${localBranch}@{upstream}`],
-      { cwd: path.resolve(repoPath), maxBuffer: 1024 * 1024 }
-    );
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--abbrev-ref", `${localBranch}@{upstream}`], {
+      cwd: path.resolve(repoPath),
+      maxBuffer: 1024 * 1024,
+    });
     const ref = stdout.trim();
     return ref && !ref.includes("@") ? ref : null;
   } catch {
@@ -255,9 +264,7 @@ export async function createWorktree(
     return { success: false, error: "Repository not found" };
   }
   const absRepo = path.resolve(repoPath);
-  const absWorktree = path.isAbsolute(worktreePath)
-    ? worktreePath
-    : path.resolve(path.dirname(absRepo), worktreePath);
+  const absWorktree = path.isAbsolute(worktreePath) ? worktreePath : path.resolve(path.dirname(absRepo), worktreePath);
   if (branch.trim() === "") {
     return { success: false, error: "Branch is required" };
   }
@@ -341,6 +348,26 @@ function runGitWorktreeAdd(
 
 export const createWorktreeCancelledError = CANCELLED_ERROR;
 
+const DEFAULT_REMOTE = "origin";
+
+/** Set branch upstream to origin/branch so push works from the worktree (e.g. in Cursor). Run from worktree dir. */
+async function setBranchUpstream(worktreePath: string, branch: string, onLog?: (text: string) => void): Promise<void> {
+  const opts = { cwd: worktreePath, maxBuffer: 1024 * 1024 };
+  try {
+    await execFileAsync("git", ["branch", "--set-upstream-to", `${DEFAULT_REMOTE}/${branch}`, branch], opts);
+    onLog?.(`Upstream set to ${DEFAULT_REMOTE}/${branch} (push will work from the worktree).\n`);
+  } catch (err: unknown) {
+    try {
+      await execFileAsync("git", ["config", `branch.${branch}.remote`, DEFAULT_REMOTE], opts);
+      await execFileAsync("git", ["config", `branch.${branch}.merge`, `refs/heads/${branch}`], opts);
+      onLog?.(`Upstream set to ${DEFAULT_REMOTE}/${branch} (push will work from the worktree).\n`);
+    } catch {
+      const msg = err instanceof Error ? err.message : String(err);
+      onLog?.(`Note: could not set upstream (${msg}). Run "git push -u origin ${branch}" once in the worktree.\n`);
+    }
+  }
+}
+
 export async function createWorktreeFromBase(
   repoPath: string,
   newBranchName: string,
@@ -357,9 +384,7 @@ export async function createWorktreeFromBase(
   if (!base) return { success: false, error: "Base branch is required" };
   const branch = newBranchName.trim().replace(/[/\\]/g, "-");
   if (!branch) return { success: false, error: "Worktree name is required" };
-  const absWorktree = path.isAbsolute(worktreePath)
-    ? worktreePath
-    : path.resolve(path.dirname(absRepo), worktreePath);
+  const absWorktree = path.isAbsolute(worktreePath) ? worktreePath : path.resolve(path.dirname(absRepo), worktreePath);
   try {
     if (signal?.aborted) return { success: false, error: CANCELLED_ERROR };
     onLog?.("Checking if branch exists…\n");
@@ -375,7 +400,11 @@ export async function createWorktreeFromBase(
     } else {
       onLog?.(`Creating branch "${branch}" and worktree at ${absWorktree}…\n`);
     }
-    return runGitWorktreeAdd(absRepo, ["-b", branch, absWorktree, startPoint], { onLog, signal });
+    const result = await runGitWorktreeAdd(absRepo, ["-b", branch, absWorktree, startPoint], { onLog, signal });
+    if (result.success) {
+      await setBranchUpstream(absWorktree, branch, onLog);
+    }
+    return result;
   } catch (err: unknown) {
     const e = err as { message?: string; stderr?: string; stdout?: string };
     const parts = [e.message, e.stderr, e.stdout].filter(Boolean) as string[];
@@ -398,7 +427,7 @@ export async function removeWorktree(
       maxBuffer: 1024 * 1024,
     });
     if (fs.existsSync(worktreePath)) {
-      fs.rmSync(worktreePath, { recursive: true, force: true });
+      await trash(worktreePath);
     }
     return { success: true };
   } catch (err: unknown) {

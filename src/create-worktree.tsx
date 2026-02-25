@@ -13,13 +13,8 @@ import {
 } from "@raycast/api";
 import { useCachedPromise } from "@raycast/utils";
 import * as path from "path";
-import {
-  createWorktreeCancelledError,
-  getAllWorktrees,
-  createWorktreeFromBase,
-  type WorktreeItem,
-} from "./lib/git";
-import { expandRoots, type Preferences } from "./lib/preferences";
+import { createWorktreeCancelledError, getAllWorktrees, createWorktreeFromBase, type WorktreeItem } from "./lib/git";
+import { expandRoots } from "./lib/preferences";
 
 /** ~100px height: show last N lines (API has no height/rows; approximate by line count) */
 const LOG_TAIL_LINES = 6;
@@ -77,7 +72,7 @@ export default function Command() {
     revalidate,
   } = useCachedPromise(fetchWorktrees);
 
-  async function handleSubmit(values: { base: string; worktreeName: string }) {
+  async function handleSubmit(values: { base: string; worktreeName: string }, options: { openAfterCreate: boolean }) {
     const basePath = (values.base ?? "").trim();
     const worktreeName = (values.worktreeName ?? "").trim();
     if (!basePath) {
@@ -112,23 +107,25 @@ export default function Command() {
     abortControllerRef.current = new AbortController();
     const signal = abortControllerRef.current.signal;
     try {
-      const result = await createWorktreeFromBase(
-        baseWorktree.repoRoot,
-        worktreeName,
-        pathToUse,
-        baseWorktree.branch,
-        { onLog: (text) => setLog((prev) => prev + text), signal }
-      );
+      const result = await createWorktreeFromBase(baseWorktree.repoRoot, worktreeName, pathToUse, baseWorktree.branch, {
+        onLog: (text) => setLog((prev) => prev + text),
+        signal,
+      });
       if (result.success) {
         setCreateSuccess(true);
         toast.style = Toast.Style.Success;
-        toast.title = "Worktree created";
-        toast.primaryAction = {
-          title: "Open in Editor",
-          onAction: () => open(pathToUse, prefs.openWith),
-        };
+        toast.title = options.openAfterCreate ? "Worktree created · Opening…" : "Worktree created";
+        if (!options.openAfterCreate) {
+          toast.primaryAction = {
+            title: "Open in Editor",
+            onAction: () => open(pathToUse, prefs.openWith),
+          };
+        }
         await new Promise((r) => setTimeout(r, 600));
-        await showHUD("Worktree created");
+        await showHUD(options.openAfterCreate ? "Worktree created · Opening…" : "Worktree created");
+        if (options.openAfterCreate) {
+          await open(pathToUse, prefs.openWith);
+        }
       } else if (result.error === createWorktreeCancelledError) {
         setLog((prev) => prev + "\nCancelled by user.\n");
         toast.style = Toast.Style.Failure;
@@ -186,25 +183,31 @@ export default function Command() {
       actions={
         <ActionPanel>
           {isSubmitting ? (
-            <Action
-              title="Cancel"
-              icon={Icon.XMarkCircle}
-              onAction={() => abortControllerRef.current?.abort()}
-            />
+            <Action title="Cancel" icon={Icon.XMarkCircle} onAction={() => abortControllerRef.current?.abort()} />
           ) : (
-            <Action.SubmitForm title="Create Worktree" onSubmit={handleSubmit} icon={Icon.Plus} />
+            <>
+              <Action.SubmitForm
+                title="Create and Open"
+                icon={Icon.ArrowRight}
+                onSubmit={(values: { base: string; worktreeName: string }) =>
+                  handleSubmit(values, { openAfterCreate: true })
+                }
+              />
+              <Action.SubmitForm
+                title="Create Only"
+                icon={Icon.Plus}
+                onSubmit={(values: { base: string; worktreeName: string }) =>
+                  handleSubmit(values, { openAfterCreate: false })
+                }
+              />
+            </>
           )}
         </ActionPanel>
       }
     >
       <Form.Dropdown id="base" title="Base" storeValue>
         {baseItems.map((item) => (
-          <Form.Dropdown.Item
-            key={item.value}
-            value={item.value}
-            title={item.title}
-            keywords={item.keywords}
-          />
+          <Form.Dropdown.Item key={item.value} value={item.value} title={item.title} keywords={item.keywords} />
         ))}
       </Form.Dropdown>
       <Form.TextField id="worktreeName" title="Worktree Name" placeholder="e.g. my-new-worktree" />
